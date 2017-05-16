@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
+import argparse
 import csv
 import io
 import json
 import os
 import re
 import requests
+import sys
 
 LOGIN_INIT_URL = 'https://login.fidelity.com/ftgw/Fas/Fidelity/RtlCust/Login/Init'
 LOGIN_RESPONSE_URL = 'https://login.fidelity.com/ftgw/Fas/Fidelity/RtlCust/Login/Response'
@@ -36,7 +38,9 @@ def process_position(position):
         'Cost Basis Total'
     }
     def process_field(field, value):
-        if field in number_fields:
+        if field == 'Symbol':
+            value = value.rstrip('*')
+        elif field in number_fields:
             value = float(re.sub(r'[^0-9\.]', '', value) if value != 'n/a' else 'nan')
         return value
     return {field: process_field(field, value) for field, value in position.items()}
@@ -100,7 +104,7 @@ class InvestoBot(object):
     def _trade_init(self):
         form = {
             'ACCOUNT': self.config['account'],
-            'ORDER_TYPE': 'E',
+            'ORDER_TYPE': 'M',
             'PRODUCT': 'ANGRBE',
             'CACHE_DATA': 'N'
         }
@@ -114,7 +118,7 @@ class InvestoBot(object):
             'FUND': 'on',
             'ORDER_TYPE': 'M',
             'SYMBOL': symbol,
-            'QTY_TYPE_D': str(amount),
+            'QTY_TYPE_D': '{:.2f}'.format(amount), # Yes, we must round or Fidelity will throw an error
             'QTY': '',
             'QTY_TYPE_S': '',
             'QTY_TYPE_A': '',
@@ -132,8 +136,8 @@ class InvestoBot(object):
             'ACCOUNT': self.config['account'],
             'ACCT_TYPE': 'C',
             'QTY_TYPE': 'D',
-            'QTY_TYPE_D': str(amount),
-            'QTY_TYPE_S': str(amount),
+            'QTY_TYPE_D': '{:.2f}'.format(amount),
+            'QTY_TYPE_S': '{:.2f}'.format(amount),
             'ORDER_ACTION': 'BF',
             'SYMBOL': symbol,
             'FUND_NEW': '',
@@ -151,15 +155,113 @@ class InvestoBot(object):
         order_num = resp['mutualFundVerify']['order']['orderNum']
         self._trade_confirm(symbol, amount, order_num)
 
+# these might be better suited to the config file, but I don't want to lose them!
+SYMBOL_GROUPS = {
+    #'CORE': 'cash',
+    'FBIDX': 'bonds',
+    #'FCASH': 'cash',
+    'FSEMX': 'midsmall_cap',
+    'FSEVX': 'midsmall_cap',
+    'FSGDX': 'intl',
+    'FSGUX': 'intl',
+    'FSITX': 'bonds',
+    'FSRVX': 'real_estate',
+    'FUSEX': 'large_cap',
+    'FUSVX': 'large_cap',
+    'FXSIX': 'large_cap',
+    #'SPAXX': 'cash',
+    #'TSLA': 'other'
+}
+
+GROUP_TARGETS = {
+    'large_cap': 0.40,
+    'midsmall_cap': 0.20,
+    'intl': 0.20,
+    'bonds': 0.10,
+    'real_estate': 0.10
+}
+
+GROUP_SYMBOLS = {
+    'large_cap': 'FUSVX',
+    'midsmall_cap': 'FSEVX',
+    'intl': 'FSGDX',
+    'bonds': 'FSITX',
+    'real_estate': 'FSRVX'
+}
+
+CASH_BUFFER = 2000
+
+assert 0.99 < sum(GROUP_TARGETS.values()) < 1.01
+
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dry-run', '-d', action='store_true')
+    args = parser.parse_args()
+
     with open(os.path.expanduser('~/.config/investobot.json')) as f:
         config = json.load(f)
+
     bot = InvestoBot(config)
     bot.login()
-    #print( bot.get_positions() )
-    #print( bot._trade_init() )
-    #print( bot._trade_verify('FUSVX', 5) )
-    #print( bot.trade('FUSVX', 10) )
+    positions = bot.get_positions()
+
+    # calculate group_totals and grand_total
+    group_totals = {}
+    grand_total = 0
+    for position in positions:
+        symbol = position['Symbol']
+        value = position['Current Value']
+        if symbol not in SYMBOL_GROUPS:
+            continue
+        group = SYMBOL_GROUPS[symbol]
+        group_totals[group] = group_totals.get(group, 0) + value
+        grand_total = grand_total + value
+
+    # calculate free_cash
+    free_cash = next(position for position in positions if position['Symbol'] == 'FCASH')['Current Value'] - CASH_BUFFER
+
+    # calculate group_buys and total_buys
+    group_buys = {}
+    total_buys = 0
+
+    while total_buys < free_cash:
+        target_groups = set()
+        min_below_target = sys.float_info.max
+
+        for group, total in group_totals.items():
+            cur = (total + group_buys.get(group, 0.0)) / (grand_total  + total_buys)
+            tgt = GROUP_TARGETS[group]
+            if cur >= tgt:
+                continue
+            target_groups.add(group)
+            min_below_target = min(min_below_target, tgt - cur)
+
+        if target_groups:
+            buy_size = min(free_cash - total_buys, min_below_target * grand_total * len(target_groups))
+        else:
+            target_groups = GROUP_SYMBOLS.keys()
+            buy_size = free_cash - total_buys
+
+        for group in target_groups:
+            group_buys[group] = group_buys.get(group, 0.0) + buy_size / len(target_groups)
+
+        total_buys += buy_size
+
+    print('{:12s} {:>8s} {:>6s} {:>9s} {:>5s} {:>9s} {:>5s} {:>5s}'.format('group', 'change$', '%', 'before$', '%', 'after$', '%', 'tgt%'))
+    for group, target in sorted(GROUP_TARGETS.items(), key=lambda gt: gt[1], reverse=True):
+        buy = group_buys.get(group, 0.0)
+        before_abs = group_totals[group]
+        before_pct = before_abs / grand_total * 100
+        after_abs = before_abs + buy
+        after_pct = after_abs / (grand_total + total_buys) * 100
+        delta_pct = after_pct - before_pct
+        target_pct = GROUP_TARGETS[group] * 100
+        print('{group:12s} {buy:>+8.2f} {delta_pct:>+6.2f} {before_abs:>9.2f} {before_pct:>5.2f} {after_abs:>9.2f} {after_pct:>5.2f} {target_pct:>5.2f}'
+            .format(**locals()))
+
+    if not args.dry_run:
+        for group, amount in group_buys.items():
+            bot.trade(GROUP_SYMBOLS[group], amount)
 
 if __name__ == '__main__':
     main()
