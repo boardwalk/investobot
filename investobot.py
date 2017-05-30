@@ -189,7 +189,7 @@ GROUP_SYMBOLS = {
     'real_estate': 'FSRVX'
 }
 
-CASH_BUFFER = 2000
+CASH_BUFFER = 3000
 
 assert 0.99 < sum(GROUP_TARGETS.values()) < 1.01
 
