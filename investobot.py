@@ -193,9 +193,11 @@ CASH_BUFFER = 3000
 
 assert 0.99 < sum(GROUP_TARGETS.values()) < 1.01
 
+ORDERS_PATH = os.path.expanduser('~/.config/investobot.orders.json')
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dry-run', '-d', action='store_true')
+    parser.add_argument('action', choices=('calculate-orders', 'execute-orders'))
     args = parser.parse_args()
 
     with open(os.path.expanduser('~/.config/investobot.json')) as f:
@@ -203,6 +205,17 @@ def main():
 
     bot = InvestoBot(config)
     bot.login()
+
+    action = globals()[args.action.replace('-', '_')]
+    action(bot)
+
+def calculate_orders(bot):
+    # delete orders
+    try:
+        os.unlink(ORDERS_PATH)
+    except FileNotFoundError:
+        pass
+
     positions = bot.get_positions()
 
     # calculate group_totals and grand_total
@@ -259,9 +272,24 @@ def main():
         print('{group:12s} {buy:>+8.2f} {delta_pct:>+6.2f} {before_abs:>9.2f} {before_pct:>5.2f} {after_abs:>9.2f} {after_pct:>5.2f} {target_pct:>5.2f}'
             .format(**locals()))
 
-    if not args.dry_run:
-        for group, amount in group_buys.items():
-            bot.trade(GROUP_SYMBOLS[group], amount)
+    # write orders
+    with open(ORDERS_PATH, 'w') as f:
+        json.dump(group_buys, f)
+
+def execute_orders(bot):
+    # read orders
+    with open(ORDERS_PATH) as f:
+        group_buys = json.load(f)
+
+    # execute orders
+    for group, amount in group_buys.items():
+        bot.trade(GROUP_SYMBOLS[group], amount)
+
+    # delete orders
+    try:
+        os.unlink(ORDERS_PATH)
+    except FileNotFoundError:
+        pass
 
 if __name__ == '__main__':
     main()
